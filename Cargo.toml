@@ -1,0 +1,26 @@
+[package]
+name = "doter"
+authors = ["Endermanbugzjfc <endermanbugzjfc@gmail.com>"]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[lib]
+name = "doter"
+path = "src/lib.rs"
+
+[[bin]]
+name = "doter-cli"
+path = "src/main.rs"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+anyhow = "1.0.72"
+clap = { version = "4.3.19", features = ["derive", "string"] }
+confy = "0.5.1"
+deser-hjson = "2.0.0"
+serde = "1.0.178"
+serde-hjson = "0.9.1"
+thiserror = "1.0.44"
+walkdir = "2.3.3"
