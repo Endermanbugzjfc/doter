@@ -20,6 +20,8 @@ anyhow = "1.0.72"
 clap = { version = "4.3.19", features = ["derive", "string"] }
 confy = "0.5.1"
 deser-hjson = "2.0.0"
+dirs = "5.0.1"
+miette = { version = "5.10.0", features = ["fancy"] }
 serde = "1.0.178"
 serde-hjson = "0.9.1"
 thiserror = "1.0.44"
