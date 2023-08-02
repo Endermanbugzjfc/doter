@@ -1,9 +1,9 @@
 use clap::{CommandFactory, Parser, ValueEnum};
 use doter::keymap;
-use miette::{miette, Diagnostic, LabeledSpan};
+use miette::{miette, Diagnostic, ErrReport, LabeledSpan, NamedSource};
 use std::{
     ffi::{OsStr, OsString},
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 use walkdir::WalkDir;
 
@@ -12,6 +12,7 @@ enum ConfigFormat {
     File,
     Toml,
     Yaml,
+    Hjson,
 }
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -38,50 +39,95 @@ struct Args {
     config_format: ConfigFormat,
     #[arg(short, long, default_value=pretty_default_packages_path())]
     packages: PathBuf,
+
     #[arg(long, default_value_t = false)]
     verbose: bool,
+    #[arg(long, default_value_t = 1)]
+    max_err: usize,
 }
 
-fn main() -> miette::Result<()> {
+macro_rules! arg_index_of {
+    ($field:ident) => {{
+        const _: () = {
+            fn assert_field(v: Args) {
+                drop(v.$field);
+            }
+        };
+        Args::command()
+            .get_matches()
+            .index_of(stringify!($field))
+            .expect("bro triggered forbidden magic")
+    }};
+}
+
+fn main() -> miette::Result<(), Vec<ErrReport>> {
     let args = Args::parse();
 
     let file_ext_keymap = Some("sublime-keymap".as_ref());
-    let keymaps = keymaps_parse(&args.packages, file_ext_keymap);
-    match keymaps
+    let keymaps = keymaps_parse(args.packages.as_path(), file_ext_keymap);
+    let reports: Vec<miette::Report> = keymaps
         .into_iter()
-        .find_map(|maybe_parse| match maybe_parse.err() {
-            Some(InitError::WalkDir(err)) => {
-                let /*mut*/ args_raw: Vec<String> = std::env::args().collect();
-                // args_raw.get_mut(0).expect("bro triggered forbidden magic").replace_range(.., "...");
+        .filter_map(|maybe_parse| -> Option<ErrReport> {
+            Some(match maybe_parse.err() {
+                Some(InitError::WalkDir(err)) => {
+                    let /*mut*/ args_raw: Vec<String> = std::env::args().collect();
+                    // args_raw.get_mut(0).expect("bro triggered forbidden magic").replace_range(.., "...");
 
-                let arg_index = Args::command().get_matches().index_of("packages").expect("this retarded programmer forgot to rename a hardcoded string literal after refactoring his spaghetti");
-                let arg_start = args_raw.iter().take(arg_index).map(|a| a.len() + 1).sum::<usize>();
-                let args_len = args_raw.get(arg_index).expect("this retarded programmer forgot to read the docs before adding random libraries to his spaghetti").len();
-                Some(
+                    let arg_index = arg_index_of!(packages);
+                    let arg_start = args_raw.iter().take(arg_index).map(|arg| arg.len() + 1).sum::<usize>();
+                    let args_len = args_raw.get(arg_index).expect("this retarded programmer forgot to read the docs before adding random libraries to his spaghetti").len();
                     miette! {
-                    labels = vec![LabeledSpan::at(arg_start..args_len+arg_start, "Invalid path!")],
+                    labels = vec![LabeledSpan::new(Some("Invalid path!".to_owned()), arg_start, args_len)],
                     url = "https://www.sublimetext.com/docs/side_by_side.html",
                     "{err}"
                     }
-                    .with_source_code(args_raw.join(" ")),
-                )
-            }
-            _ => None,
-        }) {
-        Some(err) => Err(err),
-        None => Ok(()),
-    }?;
-    Ok(())
+                    .with_source_code(args_raw.join(" "))
+                }
+                Some(InitError::Parse(path, err, raw)) => {
+                    let raw = raw.replace("\r\n", "\n").replace("\r", "");
+
+                    use deser_hjson::Error;
+                    let (heading, details): (&str, Option<(&usize, &usize, &str)>) = match &err {
+                        Error::Syntax {line, col, ..} => ("Invalid syntax! (we tried our best but is your HJSON made in China?)", Some((line, col, "Error occurred nearby"))),
+                        Error::Serde {line, col, message: msg, ..} => ("Invalid data!", Some((line, col, msg))),
+                        _ => ("", None),
+                    };
+                    let labels: Vec<LabeledSpan> = details.into_iter().map(|(line, col, msg)| {
+                        let offset = raw.lines().take(line-1).map(|raw_line| raw_line.len() + 1).sum::<usize>() - 1 + col;
+                        LabeledSpan::at_offset(offset, msg)
+                    }).collect();
+                    miette!{
+                    labels = labels,
+                    "{heading}"
+                }.with_source_code(NamedSource::new(path.to_str().unwrap_or("(<File path is not UTF-8>"), raw))}, 
+                Some(err) => ErrReport::msg(err),
+                None => return None
+        })}).take(args.max_err).collect();
+
+    if reports.len() == 0 {
+        return Ok(());
+    }
+    Err(reports)
 }
 
 #[derive(thiserror::Error, Debug, Diagnostic)]
 enum InitError {
     #[error(transparent)]
     WalkDir(#[from] walkdir::Error),
-    #[error(transparent)]
-    Io(#[from] std::io::Error),
-    #[error(transparent)]
-    Parse(#[from] deser_hjson::Error),
+    #[error("{1}")]
+    Io(PathBuf, std::io::Error),
+    #[error("{1}")]
+    Parse(PathBuf, deser_hjson::Error, String),
+}
+
+impl InitError {
+    fn path(&self) -> Option<&Path> {
+        match self {
+            Self::WalkDir(err) => err.path(),
+            Self::Io(path, _) => Some(path.as_path()),
+            Self::Parse(path, _, _) => Some(path.as_path()),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -91,7 +137,7 @@ enum KeymapsParse {
 }
 
 fn keymaps_parse(
-    path: &PathBuf,
+    path: &Path,
     file_ext_keymap: Option<&OsStr>,
 ) -> Vec<Result<(PathBuf, KeymapsParse), InitError>> {
     WalkDir::new(path)
@@ -101,8 +147,11 @@ fn keymaps_parse(
             let path = file.path();
             Ok((path.to_path_buf(), {
                 if path.extension() == file_ext_keymap {
-                    let raw = std::fs::read_to_string(path)?;
-                    KeymapsParse::Parsed(deser_hjson::from_str::<Vec<keymap::KeymapEntry>>(&raw)?)
+                    let raw = std::fs::read_to_string(path)
+                        .map_err(|err| InitError::Io(path.to_path_buf(), err))?;
+                    let parsed = deser_hjson::from_str::<Vec<keymap::KeymapEntry>>(&raw)
+                        .map_err(|err| InitError::Parse(path.to_path_buf(), err, raw))?;
+                    KeymapsParse::Parsed(parsed)
                 } else {
                     KeymapsParse::Skipped
                 }
