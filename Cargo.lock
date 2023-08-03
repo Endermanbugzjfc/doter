@@ -254,6 +254,7 @@ dependencies = [
  "deser-hjson",
  "dirs",
  "miette",
+ "nonempty",
  "serde 1.0.178",
  "serde-hjson",
  "thiserror",
@@ -401,6 +402,12 @@ checksum = "e7810e0be55b428ada41041c41f32c9f1a42817901b4ccf45fa3d4b6561e74c7"
 dependencies = [
  "adler",
 ]
+
+[[package]]
+name = "nonempty"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aeaf4ad7403de93e699c191202f017118df734d3850b01e13a3a8b2e6953d3c9"
 
 [[package]]
 name = "num-traits"

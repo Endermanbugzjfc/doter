@@ -1,6 +1,7 @@
-use clap::{CommandFactory, Parser, ValueEnum};
+use clap::{CommandFactory, FromArgMatches, Parser, ValueEnum};
 use doter::keymap;
-use miette::{miette, Diagnostic, ErrReport, LabeledSpan, NamedSource};
+use miette::{miette, Diagnostic, ErrReport, LabeledSpan, NamedSource, Severity};
+use nonempty::{nonempty, NonEmpty};
 use std::{
     ffi::{OsStr, OsString},
     path::{Path, PathBuf},
@@ -60,54 +61,84 @@ macro_rules! arg_index_of {
     }};
 }
 
-fn main() -> miette::Result<(), Vec<ErrReport>> {
-    let args = Args::parse();
+fn main() -> miette::Result<(), NonEmpty<ErrReport>> {
+    let args_raw: Vec<String> = std::env::args().collect();
+    let args_cmd = Args::command();
+    let mut matches = match args_cmd
+        .clone()
+        .try_get_matches_from_mut(std::env::args_os())
+    {
+        Ok(matches) => matches,
+        Err(err) => return Err(nonempty![miette!("{err}")]),
+    };
+    let args = Args::from_arg_matches_mut(&mut matches).expect("bro triggered forbidden magic");
 
     let file_ext_keymap = Some("sublime-keymap".as_ref());
     let keymaps = keymaps_parse(args.packages.as_path(), file_ext_keymap);
-    let reports: Vec<miette::Report> = keymaps
+
+    let (reports, io_status): (Vec<Option<miette::Report>>, Vec<Option<(PathBuf, Option<std::io::Error>)>>) = keymaps
         .into_iter()
-        .filter_map(|maybe_parse| -> Option<ErrReport> {
-            Some(match maybe_parse.err() {
-                Some(InitError::WalkDir(err)) => {
-                    let /*mut*/ args_raw: Vec<String> = std::env::args().collect();
-                    // args_raw.get_mut(0).expect("bro triggered forbidden magic").replace_range(.., "...");
+        .map(|maybe_parse| match maybe_parse {
+            Err(InitError::WalkDir(err)) => {
+                // args_raw.get_mut(0).expect("bro triggered forbidden magic").replace_range(.., "...");
 
-                    let arg_index = arg_index_of!(packages);
-                    let arg_start = args_raw.iter().take(arg_index).map(|arg| arg.len() + 1).sum::<usize>();
-                    let args_len = args_raw.get(arg_index).expect("this retarded programmer forgot to read the docs before adding random libraries to his spaghetti").len();
-                    miette! {
-                    labels = vec![LabeledSpan::new(Some("Invalid path!".to_owned()), arg_start, args_len)],
-                    url = "https://www.sublimetext.com/docs/side_by_side.html",
-                    "{err}"
-                    }
-                    .with_source_code(args_raw.join(" "))
+                let arg_index = arg_index_of!(packages);
+                let arg_start = args_raw.iter().take(arg_index).map(|arg| arg.len() + 1).sum::<usize>();
+                let args_len = args_raw.get(arg_index).expect("this retarded programmer forgot to read the docs before adding random libraries to his spaghetti").len();
+                (Some(miette! {
+                labels = vec![LabeledSpan::new(Some("Path is inaccessible".to_owned()), arg_start, args_len)],
+                url = "https://www.sublimetext.com/docs/side_by_side.html",
+                help = "Look for incorrect spellings or capitalisations. Also, check if the path leads to a DIRECTORY, a file won't work. Don't forget to ensure that all nodes in the path have proper permissions too.",
+                "{err}",
                 }
-                Some(InitError::Parse(path, err, raw)) => {
-                    let raw = raw.replace("\r\n", "\n").replace("\r", "");
+                .with_source_code(args_raw.join(" "))), None)
+            },
+            Err(InitError::Parse(path, err, raw)) => {
+                let raw = raw.replace("\r\n", "\n").replace("\r", "");
 
-                    use deser_hjson::Error;
-                    let (heading, details): (&str, Option<(&usize, &usize, &str)>) = match &err {
-                        Error::Syntax {line, col, ..} => ("Invalid syntax! (we tried our best but is your HJSON made in China?)", Some((line, col, "Error occurred nearby"))),
-                        Error::Serde {line, col, message: msg, ..} => ("Invalid data!", Some((line, col, msg))),
-                        _ => ("", None),
-                    };
-                    let labels: Vec<LabeledSpan> = details.into_iter().map(|(line, col, msg)| {
-                        let offset = raw.lines().take(line-1).map(|raw_line| raw_line.len() + 1).sum::<usize>() - 1 + col;
-                        LabeledSpan::at_offset(offset, msg)
-                    }).collect();
-                    miette!{
+                use deser_hjson::Error;
+                let (heading, details): (&str, Option<(&usize, &usize, &str)>) = match &err {
+                    Error::Syntax {line, col, ..} => ("Invalid syntax! (we tried our best but is your HJSON made in China?)", Some((line, col, "Error occurred nearby"))),
+                    Error::Serde {line, col, message: msg, ..} => ("Invalid data!", Some((line, col, msg))),
+                    _ => ("", None),
+                };
+                let labels: Vec<LabeledSpan> = details.into_iter().map(|(line, col, msg)| {
+                    let offset = raw.lines().take(line-1).map(|raw_line| raw_line.len() + 1).sum::<usize>() - 1 + col;
+                    LabeledSpan::at_offset(offset, msg)
+                }).collect();
+                (Some(miette!{
                     labels = labels,
                     "{heading}"
-                }.with_source_code(NamedSource::new(path.to_str().unwrap_or("(<File path is not UTF-8>"), raw))}, 
-                Some(err) => ErrReport::msg(err),
-                None => return None
-        })}).take(args.max_err).collect();
+                }.with_source_code(NamedSource::new(path.to_str().unwrap_or("(<File path is not UTF-8>"), raw))), Some((path, None)))
+            },
+            Err(InitError::Io(path, err)) => (None, Some((path, Some(err)))),
+            Ok((path, _)) => (None, Some((path, None))),
+        }).unzip();
+    let reports: Vec<miette::Report> = reports.into_iter().filter_map(|report| report).collect();
+    let io_status: Vec<(PathBuf, Option<std::io::Error>)> = io_status.into_iter().filter_map(|io| io).collect();
 
-    if reports.len() == 0 {
+    let mut len_reports = reports.len();
+    let reports: Vec<_> = reports.into_iter().take(args.max_err).collect();
+
+    if len_reports == 0 {
         return Ok(());
     }
-    Err(reports)
+
+    let io_fails = io_status.iter().fold(0, |fails, (_, err)| if let None = err { fails + 1} else { fails });
+    let hidden_len_reports = len_reports - reports.len();
+    Err(NonEmpty::from_vec(
+    if io_fails > 0 {
+        len_reports += 1;
+        Some(miette!{
+            help = "Please ensure that all nodes in the path have proper permissions.",
+            "{io_fails} unsucceeded file read attempts!",
+        })
+    } else {
+        None
+    }.into_iter().chain(reports.into_iter().chain((0..1).into_iter().map(|_| miette!{
+        severity= Severity::Advice,
+        "Totally {len_reports} error(s) with {hidden_len_reports} hidden. You may configure this with --max-err"
+    }))).collect()).expect("bro triggered forbidden magic"))
 }
 
 #[derive(thiserror::Error, Debug, Diagnostic)]
@@ -118,16 +149,6 @@ enum InitError {
     Io(PathBuf, std::io::Error),
     #[error("{1}")]
     Parse(PathBuf, deser_hjson::Error, String),
-}
-
-impl InitError {
-    fn path(&self) -> Option<&Path> {
-        match self {
-            Self::WalkDir(err) => err.path(),
-            Self::Io(path, _) => Some(path.as_path()),
-            Self::Parse(path, _, _) => Some(path.as_path()),
-        }
-    }
 }
 
 #[derive(Debug)]
