@@ -148,11 +148,11 @@ fn main() -> miette::Result<(), Vec<ErrReport>> {
         |fails, (_, err)| if let None = err { fails } else { fails + 1 },
     );
     let hidden_len_reports = len_reports - reports.len();
-    Err(if io_fails > 0 {
-        let string_paths: Vec<String> = io_status.into_iter().map(|(path, _err)| {
-            path.to_str_idc().0
-        }).collect();
-        let lines = tree::from(&args.packages.to_str_idc().0, string_paths.iter().map(String::as_str).collect());
+    Err(if io_fails > -1 {
+        let root = args.packages;
+        let paths: Vec<&Path> = io_status.iter().map(|(path, _)| path.as_path()).collect();
+        let lines = tree::from(canonicalize(&root).unwrap_or(root).as_path(), paths);
+        panic!("{}", lines.join("\n"));
 
         len_reports += 1;
         Some(miette!{
@@ -184,7 +184,7 @@ enum KeymapsParse {
     Parsed(Vec<keymap::KeymapEntry>),
 }
 
-fn keymaps_parse(
+fn keymaps_parse<'a>(
     path: &Path,
     file_ext_keymap: Option<&OsStr>,
 ) -> Vec<Result<(PathBuf, KeymapsParse), InitError>> {
@@ -195,10 +195,11 @@ fn keymaps_parse(
             let path = file.path();
             Ok((path.to_path_buf(), {
                 if path.extension() == file_ext_keymap {
-                    let raw = std::fs::read_to_string(path)
-                        .map_err(|err| InitError::Io(path.to_path_buf(), err))?;
+                    let bytes = &std::fs::read(path).map_err(|err| InitError::Io(path.to_path_buf(), err))?;
+                    let raw = String::from_utf8_lossy(bytes);
+
                     let parsed = deser_hjson::from_str::<Vec<keymap::KeymapEntry>>(&raw)
-                        .map_err(|err| InitError::Parse(path.to_path_buf(), err, raw))?;
+                        .map_err(|err| InitError::Parse(path.to_path_buf(), err, raw.to_string()))?;
                     KeymapsParse::Parsed(parsed)
                 } else {
                     KeymapsParse::Skipped
@@ -208,134 +209,91 @@ fn keymaps_parse(
         .collect()
 }
 
-trait PathIdc {
-    fn to_str_idc(&self) -> (String, bool);
-    fn parent_idc(&self) -> &Self;
-}
-
-impl PathIdc for Path {
-    fn to_str_idc(&self) -> (String, bool) {
-        if let Some(utf8) = self.to_str() {
-            (utf8.to_owned(), true)
-        } else {
-            let len_os_str = self.as_os_str().len();
-            (format!("<Path consists of {len_os_str} byte(s) that is out of UTF-8>"), false)
-        }
-    }
-
-    fn parent_idc(&self) -> &Self {
-        self.parent().expect("bro uses a chinese off brand 档案系统")
-    }
-}
-
 /// https://stackoverflow.com/a/60498568/13787084
 mod tree {
-    use std::path::MAIN_SEPARATOR;
-
-    // A type to represent a path, split into its component parts
-    #[derive(Debug)]
-    struct Path {
-        parts: Vec<String>,
+    use std::{path::Path, ffi::{OsStr, OsString}};
+    // A recursive type to represent a directory tree.
+    // Simplification: If it has children, it is considered
+    // a directory, else considered a file.
+    #[derive(Debug, Clone)]
+    struct Dir {
+        name: OsString,
+        children: Vec<Box<Dir>>,
     }
-    impl Path {
-        pub fn new(path: &str) -> Path {
-            Path {
-                parts: path.to_string().split(MAIN_SEPARATOR).map(|s| s.to_string()).collect(),
+
+    impl Dir {
+        fn new(name: OsString) -> Self {
+            Dir {
+                name,
+                children: Vec::<Box<Self>>::new(),
             }
         }
-    }
 
-// A recursive type to represent a directory tree.
-// Simplification: If it has children, it is considered
-// a directory, else considered a file.
-#[derive(Debug, Clone)]
-struct Dir {
-    name: String,
-    children: Vec<Box<Dir>>,
-}
-
-impl Dir {
-    fn new(name: &str) -> Dir {
-        Dir {
-            name: name.to_string(),
-            children: Vec::<Box<Dir>>::new(),
-        }
-    }
-
-    fn find_child(&mut self, name: &str) -> Option<&mut Dir> {
-        for c in self.children.iter_mut() {
-            if c.name == name {
-                return Some(c);
-            }
-        }
-        None
-    }
-
-    fn add_child<T>(&mut self, leaf: T) -> &mut Self
-    where
-    T: Into<Dir>,
-    {
-        self.children.push(Box::new(leaf.into()));
-        self
-    }
-}
-
-fn dir(val: &str) -> Dir {
-    Dir::new(val)
-}
-
-pub fn from(root: &str, paths: Vec<&str>) -> Vec<String> {
-    // Form our INPUT:  a list of paths.
-    let paths: Vec<Path> = paths.into_iter().map(Path::new).collect();
-
-    // Transformation:
-    // A recursive algorithm that converts the list of paths
-    // above to Dir (tree) below.
-    // ie: paths --> dir
-    let mut top = dir(root);
-    for path in paths.iter() {
-        build_tree(&mut top, &path.parts, 0);
-    }
-
-    // Output:  textual `tree` format
-    print_dir(&top, 0)
-}
-
-fn build_tree(node: &mut Dir, parts: &Vec<String>, depth: usize) {
-    if depth < parts.len() {
-        let item = &parts[depth];
-
-        let mut dir = match node.find_child(&item) {
-            Some(d) => d,
-            None => {
-                let d = Dir::new(&item);
-                node.add_child(d);
-                match node.find_child(&item) {
-                    Some(d2) => d2,
-                    None => panic!("Got here!"),
+        fn find_child(&mut self, name: &OsStr) -> Option<&mut Self> {
+            for c in self.children.iter_mut() {
+                if c.name == name {
+                    return Some(c);
                 }
             }
-        };
-        build_tree(&mut dir, parts, depth + 1);
+            None
+        }
+
+        fn add_child(& mut self, leaf: Self) -> &mut Self
+        {
+            self.children.push(Box::new(leaf));
+            self
+        }
     }
-}
 
-// A function to print a Dir in format similar to unix `tree` command.
-fn print_dir(dir: &Dir, depth: u32) -> Vec<String> {
-    let iter = vec![if depth == 0 {
-        format!("{}", dir.name)
-    } else {
-        format!(
-            "{:indent$}{} {}",
-            "",
-            "└──",
-            dir.name,
-            indent = ((depth as usize) - 1) * 4
-            )
-    }].into_iter();
+    /// Form our INPUT:  a list of paths.
+    pub fn from(root: &Path, paths: Vec<&Path>) -> Vec<String> {
+        // Transformation:
+        // A recursive algorithm that converts the list of paths
+        // above to Dir (tree) below.
+        // ie: paths --> dir
+        let mut top = Dir{name: root.into(), children: vec![]};
+        for path in paths.into_iter() {
+            build_tree(&mut top, &path, 0);
+        }
 
-    let iter2 = dir.children.iter().flat_map(|child| print_dir(child, depth + 1));
+        // Output:  textual `tree` format
+        print_dir(&top, 0)
+    }
 
-    iter.chain(iter2).collect()
-}
+    // fn build_tree(node: &mut Dir, parts: &Vec<String>, depth: usize) {
+    fn build_tree(node: &mut Dir, parts: &Path, depth: usize) {
+            let item = if let Some(x) = parts.iter().nth(depth) { x } else { return };
+
+            let mut dir = match node.find_child(&item) {
+                Some(d) => d,
+                None => {
+                    let d = Dir::new(item.into());
+                    node.add_child(d);
+                    match node.find_child(&item) {
+                        Some(d2) => d2,
+                        None => panic!("Got here!"),
+                    }
+                }
+            };
+            build_tree(&mut dir, parts, depth + 1);
+    }
+
+    // A function to print a Dir in format similar to unix `tree` command.
+    fn print_dir(dir: &Dir, depth: u32) -> Vec<String> {
+        let iter = vec![if depth == 0 {
+            format!("{}", dir.name.to_string_lossy())
+        } else {
+            format!(
+                "{:indent$}{} {}",
+                "",
+                "└──",
+                dir.name.to_string_lossy(),
+                indent = ((depth as usize) - 1) * 4
+                )
+        }].into_iter();
+
+        let iter2 = dir.children.iter().flat_map(|child| print_dir(child, depth + 1));
+
+        iter.chain(iter2).collect()
+    }
 }
